@@ -123,6 +123,7 @@ struct websocket {
   struct curl_ws_frame recvframe;  /* the current WS FRAME received */
   struct ws_cntrl_frame pending; /* a control frame pending to be sent */
   size_t sendbuf_payload; /* number of payload bytes in sendbuf */
+  BIT(app_send_pending);  /* application frame awaiting send completion */
   BIT(using_reader);      /* sending WS data is handled via a client reader */
 };
 
@@ -1089,7 +1090,7 @@ static CURLcode ws_enc_send(struct Curl_easy *data,
   DEBUGASSERT(!data->set.ws_raw_mode);
   *pnsent = 0;
 
-  if(ws->enc.payload_remain || !Curl_bufq_is_empty(&ws->sendbuf)) {
+  if(ws->app_send_pending || ws->enc.payload_remain) {
     /* a frame is ongoing with payload buffered or more payload
      * that needs to be encoded into the buffer */
     if(buflen < ws->sendbuf_payload) {
@@ -1124,6 +1125,9 @@ static CURLcode ws_enc_send(struct Curl_easy *data,
       return result;
     }
   }
+
+  /* Frame headers belong to the application send even without payload. */
+  ws->app_send_pending = TRUE;
 
   /* While there is either sendbuf to flush OR more payload to encode... */
   while(!Curl_bufq_is_empty(&ws->sendbuf) || (buflen > ws->sendbuf_payload)) {
@@ -1419,6 +1423,7 @@ CURLcode Curl_ws_accept(struct Curl_easy *data,
     Curl_bufq_reset(&ws->recvbuf);
     ws_dec_reset(&ws->dec);
     ws_enc_reset(&ws->enc);
+    ws->app_send_pending = FALSE;
   }
   /* Verify the Sec-WebSocket-Accept response.
 
@@ -1647,6 +1652,16 @@ CURLcode curl_ws_recv(CURL *curl, void *buffer,
       /* receive more when our buffer is empty */
       if(Curl_bufq_is_empty(&ws->recvbuf)) {
         size_t n;
+        /* A peer may wait for our PONG before sending more data. Also retry
+         * control frames already encoded when a previous send blocked. Leave
+         * application-owned frames to curl_ws_send(), including empty ones. */
+        if(!data->set.ws_raw_mode && !ws->using_reader &&
+           !ws->app_send_pending &&
+           (ws->pending.type || !Curl_bufq_is_empty(&ws->sendbuf))) {
+          result = ws_flush(data, ws, Curl_api_is_in_callback(data));
+          if(result && result != CURLE_AGAIN)
+            goto out;
+        }
         result = Curl_bufq_slurp(&ws->recvbuf, nw_in_recv, data, &n);
         if(result)
           goto out;
@@ -1691,7 +1706,8 @@ CURLcode curl_ws_recv(CURL *curl, void *buffer,
                 ws->recvframe.bytesleft);
     /* all's well, try to send any pending control. we do not know
      * when the application will call `curl_ws_send()` again. */
-    if(!data->set.ws_raw_mode && !ws->using_reader && ws->pending.type) {
+    if(!data->set.ws_raw_mode && !ws->using_reader &&
+       !ws->app_send_pending && ws->pending.type) {
       CURLcode r2 = ws_enc_add_pending(data, ws);
       if(!r2)
         (void)ws_flush(data, ws, Curl_api_is_in_callback(data));
@@ -1924,6 +1940,9 @@ CURLcode curl_ws_send(CURL *curl, const void *buffer_arg,
 
     /* Not RAW mode, we do the frame encoding */
     result = ws_enc_send(data, ws, buffer, buflen, fragsize, flags, pnsent);
+    if(!result && !ws->enc.payload_remain && !ws->sendbuf_payload &&
+       Curl_bufq_is_empty(&ws->sendbuf))
+      ws->app_send_pending = FALSE;
     CURL_TRC_WS(data, "curl_ws_send(len=%zu, fragsize=%" FMT_OFF_T
                 ", flags=%x, raw=%d) -> %d, %zu",
                 buflen, fragsize, flags, data->set.ws_raw_mode, (int)result,
